@@ -1,0 +1,9 @@
+__pycache__/
+.ipynb_checkpoints/
+Untitled.ipynb
+*.log
+smoke.csv
+
+# Outputs from earlier versions, kept locally only
+logd_pred.csv
+logd.npz

@@ -1,0 +1,43 @@
+# Environment for monroe_tabicl.py.
+#
+# These are the versions the LogD test (see README.md) was run with, on
+# Python 3.12 / macOS arm64, CPU only.
+#
+#   conda create -n monroe python=3.12
+#   conda activate monroe
+#   pip install -r requirements.txt
+#
+# Monroe itself is not installed from here. The script imports it from a checkout
+# of https://github.com/blazejba/monroe (tested at 57238ed), found through
+# MONROE_HOME (default ~/software/monroe), and the encoder weights live in that
+# checkout under Git LFS:
+#
+#   git clone https://github.com/blazejba/monroe ~/software/monroe
+#   cd ~/software/monroe && git lfs pull
+#
+# TabICL's checkpoint is public (BSD 3-Clause) and is downloaded from Hugging Face
+# on first use; no account or token is needed.
+
+# The head. The script names the TabICLv2 checkpoint itself, so the version
+# does not choose the model, but it is pinned to 2.1.1, the release the
+# validation study's Monroe + TabICL arm used; 2.2.0 changes the inference code.
+tabicl==2.1.1
+
+# On a Linux GPU machine, install the torch build for your CUDA version first,
+# e.g. pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
+torch==2.14.1
+torch-geometric==2.8.0.post1
+
+# Monroe's featurizer and encoder
+rdkit==2026.3.6
+datamol==0.13.0
+tqdm==4.70.1
+wandb==0.30.0          # imported by monroe.model.ckpt, never used for logging here
+pyarrow==25.0.1
+
+# The script
+psutil==7.2.2          # the memory guard around TabICL
+numpy==2.5.3
+pandas==3.0.6
+scipy==1.18.1
+scikit-learn==1.9.1
