@@ -1,15 +1,20 @@
 #!/usr/bin/env python
-"""Build and apply a Monroe + TabICLv2 regression model from a CSV of SMILES.
+"""Build and apply a Monroe + TabICLv2 model from a CSV of SMILES.
 
 Monroe is a frozen graph-transformer encoder that turns each molecule into one
 720-d vector. TabICLv2 reads those vectors in context: it is handed the training
 embeddings with their labels and predicts new molecules in one forward pass, with
 no weights updated. So "training" here means embedding the training set, and a
 saved model is those embeddings, their labels and the settings used to make them.
-Predicting embeds the new molecules and hands both sets to TabICL.
+Predicting embeds the new molecules and hands both sets to TabICL. Both TabICLv2
+heads are supported: regression (the default) and classification.
 
     # train, report 5-fold CV, and save the model
     python monroe_tabicl.py train expansion_train.csv SMILES "HLM CLint" --log --cv 5 --save hlm.npz
+
+    # classify instead: LogD >= 2 against LogD < 2
+    python monroe_tabicl.py train expansion_train.csv SMILES LogD --task classification \
+        --threshold 2 --cv 5 --save logd_cls.npz
 
     # predict new molecules with the saved model
     python monroe_tabicl.py predict expansion_test.csv SMILES --model hlm.npz -o hlm_pred.csv
@@ -29,10 +34,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# The in-context head: TabICLv2, through the authors' `tabicl` package. Named
+# The in-context heads: TabICLv2, through the authors' `tabicl` package. Named
 # explicitly rather than left to the package default, so a later tabicl release
 # cannot change which model a saved run used.
-TABICL_CHECKPOINT = "tabicl-regressor-v2-20260212.ckpt"
+TABICL_CHECKPOINTS = {
+    "regression": "tabicl-regressor-v2-20260212.ckpt",
+    "classification": "tabicl-classifier-v2-20260212.ckpt",
+}
+TASKS = list(TABICL_CHECKPOINTS)
+# TabICLv2 handles up to 10 classes natively. Beyond that it needs its many-class
+# mode, which cannot use the KV cache the memory guard below depends on.
+MAX_CLASSES = 10
 
 MONROE_HOME = Path(
     os.environ.get("MONROE_HOME", Path.home() / "software" / "monroe")
@@ -42,7 +54,9 @@ CHECKPOINT_DIR = MONROE_HOME / "checkpoint"
 # The width of Monroe's graph-level embedding. Checked after embedding, because a
 # different checkpoint would still produce vectors and still fit.
 EMBEDDING_DIM = 720
-MODEL_FORMAT = 1
+# Format 2 added classification. Format 1 files (regression only) still load.
+MODEL_FORMAT = 2
+READABLE_FORMATS = {1, 2}
 
 
 def monroe_modules():
@@ -206,7 +220,8 @@ def embed(smiles: list[str], batch_size: int, workers: int | None) -> tuple[np.n
 # training rows), over 4.3 KB at 720. The estimate uses 5 KB to stay on the safe
 # side. With kv_cache="repr" the training rows are worked through once in fit()
 # and only `PREDICT_CHUNK` new rows at a time in predict(), so the rows that
-# count are the larger of the two.
+# count are the larger of the two. Measured on the regressor; the classifier is
+# the same network with a different output layer and uses the same estimate.
 MEMORY_BASE_GB = 6.0
 MEMORY_PER_CELL_KB = 5.0
 PREDICT_CHUNK = 500
@@ -277,21 +292,41 @@ def _tabicl_worker(in_path: str, out_path: str) -> None:
     the predictions by rounding only (< 1e-5 on LogD).
 
     TabICL reports no progress of its own, so the bars count its passes: with
-    batch_size=1 it calls predict_stats_with_cache once per ensemble member,
-    in fit() to cache the training rows and in predict() for each chunk.
+    batch_size=1 it makes one pass per ensemble member, in fit() to cache the
+    training rows and in predict() for each chunk. The regressor's passes go
+    through predict_stats_with_cache, the classifier's through forward_with_cache.
+
+    For classification the result is one probability column per class, 0 to
+    n_classes - 1, even if the fit rows (a CV fold) lack some of the classes.
     """
-    from tabicl import TabICLRegressor
+    from tabicl import TabICLClassifier, TabICLRegressor
     from tabicl._model.tabicl import TabICL
     from tqdm import tqdm
 
     data = np.load(in_path)
-    X_query, output_type = data["X_query"], str(data["output_type"])
-    model = TabICLRegressor(checkpoint_version=TABICL_CHECKPOINT,
-                            random_state=int(data["seed"]), device=str(data["device"]),
-                            batch_size=1, kv_cache="repr")
+    X_query, task = data["X_query"], str(data["task"])
+    settings = dict(checkpoint_version=TABICL_CHECKPOINTS[task], random_state=int(data["seed"]),
+                    device=str(data["device"]), batch_size=1, kv_cache="repr")
+    if task == "classification":
+        model, pass_name = TabICLClassifier(**settings), "forward_with_cache"
+        n_classes = int(data["n_classes"])
+
+        def predict_chunk(X):
+            proba = np.zeros((len(X), n_classes))
+            proba[:, model.classes_.astype(int)] = model.predict_proba(X)
+            # TabICL computes in float32, so the rows can miss summing to 1 by
+            # rounding, which sklearn's log loss and ROC AUC warn about or reject.
+            return proba / proba.sum(axis=1, keepdims=True)
+    else:
+        model, pass_name = TabICLRegressor(**settings), "predict_stats_with_cache"
+        output_type = str(data["output_type"])
+
+        def predict_chunk(X):
+            return model.predict(X, output_type=output_type)
+
     bars = {"fit": tqdm(total=model.n_estimators, desc="TabICL fit", unit="pass",
                         dynamic_ncols=True)}
-    one_pass = TabICL.predict_stats_with_cache
+    one_pass = getattr(TabICL, pass_name)
 
     def counted_pass(self, *args, **kwargs):
         out = one_pass(self, *args, **kwargs)
@@ -299,22 +334,25 @@ def _tabicl_worker(in_path: str, out_path: str) -> None:
         bars["fit" if kwargs.get("store_cache") else "predict"].update(1)
         return out
 
-    TabICL.predict_stats_with_cache = counted_pass  # this child process only
+    setattr(TabICL, pass_name, counted_pass)  # this child process only
     model.fit(data["X_fit"], data["y_fit"])
     bars["fit"].close()
     n_chunks = -(-len(X_query) // PREDICT_CHUNK)
     bars["predict"] = tqdm(total=model.n_estimators * n_chunks, desc="TabICL predict",
                            unit="pass", dynamic_ncols=True)
-    pred = np.concatenate([model.predict(X_query[start:start + PREDICT_CHUNK],
-                                         output_type=output_type)
+    pred = np.concatenate([predict_chunk(X_query[start:start + PREDICT_CHUNK])
                            for start in range(0, len(X_query), PREDICT_CHUNK)])
     bars["predict"].close()
     np.save(out_path, pred)
 
 
-def predict_tabicl(X_fit, y_fit, X_query, seed: int, output_type: str,
-                   max_memory: float | None = None) -> np.ndarray:
-    """TabICLv2 predictions for X_query given the labelled context, memory-guarded."""
+def predict_tabicl(X_fit, y_fit, X_query, seed: int, task: str, output_type: str = "mean",
+                   n_classes: int = 0, max_memory: float | None = None) -> np.ndarray:
+    """TabICLv2 predictions for X_query given the labelled context, memory-guarded.
+
+    Regression gives one value per row; classification gives an (n, n_classes)
+    array of probabilities, with y_fit holding class indices 0 to n_classes - 1.
+    """
     import multiprocessing as mp
     import tempfile
 
@@ -325,7 +363,7 @@ def predict_tabicl(X_fit, y_fit, X_query, seed: int, output_type: str,
     with tempfile.TemporaryDirectory() as tmp:
         in_path, out_path = f"{tmp}/in.npz", f"{tmp}/out.npy"
         np.savez(in_path, X_fit=X_fit, y_fit=y_fit, X_query=X_query, seed=seed,
-                 device=device_name(), output_type=output_type)
+                 device=device_name(), task=task, output_type=output_type, n_classes=n_classes)
         # spawn, not fork: a clean interpreter, and no copy of the parent's memory.
         child = mp.get_context("spawn").Process(target=_tabicl_worker, args=(in_path, out_path))
         child.start()
@@ -454,21 +492,107 @@ def unscale(pred: np.ndarray, transform: dict) -> np.ndarray:
     return 10 ** pred
 
 
-def cross_validate(X, y, groups, n_folds: int, seed: int, output_type: str,
-                   max_memory: float | None) -> None:
+def class_labels(values: pd.Series, threshold: float | None, name: str):
+    """The target as class indices, for classification.
+
+    With `threshold`, a numeric target is split in two: below it, and at or
+    above it. Without, every distinct value is a class; a numeric column whose
+    values are all whole numbers (0/1, say) gets labels "0", "1" rather than
+    "0.0", "1.0".
+
+    Returns the class index of each row (-1 where the target is missing), and
+    the class labels in index order.
+    """
+    if threshold is not None:
+        numeric = pd.to_numeric(values, errors="coerce")
+        if numeric.notna().sum() < values.notna().sum():
+            raise SystemExit(f"--threshold needs a numeric target, but "
+                             f"{int(values.notna().sum() - numeric.notna().sum())} values of "
+                             f"{name!r} are not numbers")
+        classes = [f"<{threshold:g}", f">={threshold:g}"]
+        idx = np.where(numeric.isna(), -1, (numeric >= threshold).astype(int))
+        return idx.astype(int), classes
+
+    labels = values.copy()
+    numeric = pd.to_numeric(values, errors="coerce")
+    if numeric.notna().sum() == values.notna().sum() and (numeric.dropna() % 1 == 0).all():
+        labels = numeric.astype("Int64")
+    labels = labels.astype(str).where(values.notna())
+    classes = sorted(labels.dropna().unique())
+    if len(classes) > MAX_CLASSES:
+        raise SystemExit(f"{name!r} has {len(classes)} distinct values; TabICL classifies at most "
+                         f"{MAX_CLASSES} classes here. Is it continuous? Use --threshold to split "
+                         "it, or leave out --task classification to model it by regression")
+    lookup = {c: i for i, c in enumerate(classes)}
+    return labels.map(lookup).fillna(-1).astype(int).to_numpy(), classes
+
+
+def cv_folds(groups, n_folds: int, seed: int, y=None) -> np.ndarray:
+    """The CV fold of each row, grouped so duplicate SMILES never straddle folds.
+
+    With class labels `y` the folds are also stratified, so a rare class is
+    spread across them rather than missing from some.
+    """
+    if y is not None:
+        from sklearn.model_selection import StratifiedGroupKFold
+
+        fold_of = np.empty(len(y), dtype=int)
+        splitter = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+        for k, (_, test) in enumerate(splitter.split(np.zeros(len(y)), y, groups)):
+            fold_of[test] = k
+        return fold_of
+    unique, group_idx = np.unique(groups, return_inverse=True)
+    fold_of_group = np.random.default_rng(seed).permutation(len(unique)) % n_folds
+    return fold_of_group[group_idx]
+
+
+def cross_validate(X, y, groups, n_folds: int, seed: int, task: str, output_type: str,
+                   classes: list[str] | None, max_memory: float | None) -> None:
     """K-fold CV over the training set, grouped so duplicate SMILES never straddle folds."""
+    classify = task == "classification"
+    fold_of = cv_folds(groups, n_folds, seed, y if classify else None)
+
+    pred = np.empty((len(y), len(classes)) if classify else len(y))
+    for k in range(n_folds):
+        fit, test = fold_of != k, fold_of == k
+        pred[test] = predict_tabicl(X[fit], y[fit], X[test], seed, task, output_type,
+                                    len(classes) if classify else 0, max_memory)
+        print(f"  fold {k + 1}/{n_folds} done", flush=True)
+    if classify:
+        report_classification(y, pred, classes, n_folds)
+    else:
+        report_regression(y, pred, n_folds)
+
+
+def report_classification(y, proba, classes: list[str], n_folds: int) -> None:
+    from sklearn.metrics import (accuracy_score, balanced_accuracy_score, log_loss,
+                                 roc_auc_score)
+
+    pred = proba.argmax(axis=1)
+    labels = list(range(len(classes)))
+    if len(classes) == 2:
+        auc = roc_auc_score(y, proba[:, 1])
+    else:
+        auc = roc_auc_score(y, proba, multi_class="ovr", labels=labels)
+    print(f"{n_folds}-fold CV: "
+          f"accuracy {accuracy_score(y, pred):.3f}  "
+          f"balanced accuracy {balanced_accuracy_score(y, pred):.3f}  "
+          f"ROC AUC {auc:.3f}"
+          + ("" if len(classes) == 2 else " (one-vs-rest, macro)")
+          + f"  log loss {log_loss(y, proba, labels=labels):.3f}")
+    width = max(len(c) for c in classes)
+    print(f"  {'class':<{width}}  {'n':>6}  {'recall':>6}  {'precision':>9}")
+    for i, c in enumerate(classes):
+        actual, called = y == i, pred == i
+        recall = (pred[actual] == i).mean() if actual.any() else float("nan")
+        precision = (y[called] == i).mean() if called.any() else float("nan")
+        print(f"  {c:<{width}}  {int(actual.sum()):>6}  {recall:>6.3f}  {precision:>9.3f}")
+
+
+def report_regression(y, pred, n_folds: int) -> None:
     from scipy.stats import spearmanr
     from sklearn.metrics import mean_absolute_error, r2_score
 
-    unique, group_idx = np.unique(groups, return_inverse=True)
-    fold_of_group = np.random.default_rng(seed).permutation(len(unique)) % n_folds
-    fold_of = fold_of_group[group_idx]
-
-    pred = np.empty_like(y)
-    for k in range(n_folds):
-        fit, test = fold_of != k, fold_of == k
-        pred[test] = predict_tabicl(X[fit], y[fit], X[test], seed, output_type, max_memory)
-        print(f"  fold {k + 1}/{n_folds} done", flush=True)
     print(f"{n_folds}-fold CV (modelled scale): "
           f"R2 {r2_score(y, pred):.3f}  "
           f"Spearman {spearmanr(y, pred).statistic:.3f}  "
@@ -478,16 +602,38 @@ def cross_validate(X, y, groups, n_folds: int, seed: int, output_type: str,
 def train(args) -> None:
     if args.features < 0:
         raise SystemExit("--features must be 0 (all) or a positive number")
+    classify = args.task == "classification"
+    if classify:
+        given = [flag for flag, value in [("--log", args.log), ("--floor", args.floor),
+                                          ("--offset", args.offset),
+                                          ("--output-type", args.output_type)] if value]
+        if given:
+            raise SystemExit(f"{', '.join(given)} "
+                             f"only appl{'ies' if len(given) == 1 else 'y'} to regression")
+    elif args.threshold is not None:
+        raise SystemExit("--threshold only applies with --task classification")
+    output_type = args.output_type or "mean"
+
     df = read_table(args.file, [args.smiles_col, args.target_col])
-    y_raw = pd.to_numeric(df[args.target_col], errors="coerce")
-    keep = y_raw.notna() & df[args.smiles_col].notna()
+    classes = None
+    if classify:
+        y_all, classes = class_labels(df[args.target_col], args.threshold, args.target_col)
+        keep = (y_all >= 0) & df[args.smiles_col].notna()
+        what = ""
+    else:
+        y_all = pd.to_numeric(df[args.target_col], errors="coerce")
+        keep = y_all.notna() & df[args.smiles_col].notna()
+        y_all, what = y_all.to_numpy(float), "numeric "
+    keep = np.asarray(keep)
     if (~keep).sum():
-        print(f"skipping {int((~keep).sum())} rows with no SMILES or no numeric "
+        print(f"skipping {int((~keep).sum())} rows with no SMILES or no {what}"
               f"{args.target_col!r}")
-    df, y_raw = df.loc[keep].reset_index(drop=True), y_raw[keep].to_numpy(float)
+    df, y_raw = df.loc[keep].reset_index(drop=True), y_all[keep]
 
     transform = None
-    if args.log:
+    if classify:
+        y = y_raw
+    elif args.log:
         if args.floor is not None and args.zeros != "floor":
             raise SystemExit("--floor only applies with --zeros floor")
         if args.offset is not None and args.zeros != "offset":
@@ -513,6 +659,17 @@ def train(args) -> None:
     X, y, smiles = X[ok], y[ok], [s for s, good in zip(smiles, ok) if good]
     print(f"training set: {len(y)} molecules"
           + (" (target log10 scaled)" if args.log else ""))
+    if classify:
+        counts = np.bincount(y, minlength=len(classes))
+        print("classes: " + ", ".join(f"{c} {n}" for c, n in zip(classes, counts)))
+        if (counts == 0).any():
+            raise SystemExit(f"no training molecules left in class(es) "
+                             f"{', '.join(c for c, n in zip(classes, counts) if not n)}")
+        if len(classes) < 2:
+            raise SystemExit(f"{args.target_col!r} has only one class, {classes[0]!r}")
+        if args.cv and counts.min() < args.cv:
+            print(f"warning: the smallest class has {counts.min()} molecules, fewer than the "
+                  f"{args.cv} folds, so some folds have none of it to learn from or test")
     # Chosen on the training embeddings alone (no labels), and stored with the
     # model so predict uses the same ones.
     cols = select_features(X, args.features)
@@ -520,8 +677,8 @@ def train(args) -> None:
           + (" (highest variance)" if len(cols) < X.shape[1] else ""))
 
     if args.cv:
-        cross_validate(X[:, cols], y, np.array(smiles), args.cv, args.seed, args.output_type,
-                       args.max_memory)
+        cross_validate(X[:, cols], y, np.array(smiles), args.cv, args.seed, args.task,
+                       output_type, classes, args.max_memory)
 
     if args.save:
         import importlib.metadata
@@ -530,15 +687,19 @@ def train(args) -> None:
             "format": MODEL_FORMAT,
             "smiles_col": args.smiles_col,
             "target_col": args.target_col,
+            "task": args.task,
+            # Classification: y holds indices into `classes`.
+            "classes": classes,
+            "threshold": args.threshold,
             "log10": bool(args.log),
             "log_transform": transform,
             "seed": args.seed,
             "conformer_seed": CONFORMER_SEED,
-            "output_type": args.output_type,
+            "output_type": output_type,
             "head": "tabicl",
             # tabicl carries no __version__, so ask the installed distribution.
             "tabicl_version": importlib.metadata.version("tabicl"),
-            "tabicl_checkpoint": TABICL_CHECKPOINT,
+            "tabicl_checkpoint": TABICL_CHECKPOINTS[args.task],
             "features": int(len(cols)),
             # The name only: a full path would carry the local directory layout
             # into every model file that gets shared.
@@ -563,7 +724,7 @@ def load_model(path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
         raise SystemExit(f"{path}: no such model file")
     except (OSError, ValueError, KeyError):
         raise SystemExit(f"{path}: not a model saved by this script (train --save)")
-    if meta.get("format") != MODEL_FORMAT:
+    if meta.get("format") not in READABLE_FORMATS:
         raise SystemExit(f"{path}: not a model saved by this script (train --save)")
     return X, y, cols, meta
 
@@ -573,14 +734,16 @@ def predict(args) -> None:
     import importlib.metadata
 
     installed = importlib.metadata.version("tabicl")
+    # Models saved before classification existed are all regression.
+    task = meta.get("task", "regression")
     if meta.get("head") != "tabicl":
         # A model is only embeddings, values and settings, so one saved by the
         # TabPFN version of this script works as it is.
         print("note: this model was saved by the TabPFN version of this script; "
               "its training set is used as it is, with TabICLv2 predicting")
-    elif meta["tabicl_checkpoint"] != TABICL_CHECKPOINT:
+    elif meta["tabicl_checkpoint"] != TABICL_CHECKPOINTS[task]:
         print(f"warning: model saved with TabICL checkpoint {meta['tabicl_checkpoint']}, "
-              f"predicting with {TABICL_CHECKPOINT}")
+              f"predicting with {TABICL_CHECKPOINTS[task]}")
     elif meta["tabicl_version"] != installed:
         print(f"warning: model saved with tabicl {meta['tabicl_version']}, running "
               f"{installed}; predictions may differ slightly")
@@ -596,12 +759,28 @@ def predict(args) -> None:
     if (~ok).sum():
         print(f"{int((~ok).sum())} molecules could not be featurized; their predictions are empty")
 
+    name = meta["target_col"]
+    if task == "classification":
+        classes = meta["classes"]
+        proba = np.full((len(df), len(classes)), np.nan)
+        if ok.any():
+            proba[ok] = predict_tabicl(X_fit[:, cols], y_fit, X[ok][:, cols], meta["seed"],
+                                       task, n_classes=len(classes), max_memory=args.max_memory)
+        # The most probable class, and the probability of each.
+        df[f"{name}_pred"] = pd.Series(np.array(classes, dtype=object)[
+            np.nan_to_num(proba, nan=0).argmax(axis=1)]).where(ok)
+        for i, c in enumerate(classes):
+            df[f"{name}_prob_{c}"] = proba[:, i]
+        out = args.output or f"{Path(args.file).stem}_pred.csv"
+        df.to_csv(out, index=False)
+        print(f"wrote {int(ok.sum())} predictions to {out}")
+        return
+
     pred = np.full(len(df), np.nan)
     if ok.any():
-        pred[ok] = predict_tabicl(X_fit[:, cols], y_fit, X[ok][:, cols], meta["seed"],
-                                  meta["output_type"], args.max_memory)
+        pred[ok] = predict_tabicl(X_fit[:, cols], y_fit, X[ok][:, cols], meta["seed"], task,
+                                  meta["output_type"], max_memory=args.max_memory)
 
-    name = meta["target_col"]
     if meta["log10"]:
         # Models saved before --zeros existed refused zeros outright.
         transform = meta.get("log_transform") or {"zeros": "error"}
@@ -635,6 +814,13 @@ def main() -> None:
     p.add_argument("file", help="CSV with SMILES and the values to model")
     p.add_argument("smiles_col", help="name of the SMILES column")
     p.add_argument("target_col", help="name of the column to predict")
+    p.add_argument("--task", default="regression", choices=TASKS,
+                   help="regression (default) or classification. For classification each "
+                        f"distinct value of the target is a class (at most {MAX_CLASSES}), "
+                        "unless --threshold splits a numeric target in two")
+    p.add_argument("--threshold", type=float, default=None, metavar="T",
+                   help="with --task classification, classify a numeric target as < T "
+                        "or >= T")
     p.add_argument("--log", action="store_true",
                    help="model log10 of the target; predictions are reported in both scales")
     p.add_argument("--zeros", default="drop", choices=ZERO_STRATEGIES,
@@ -652,10 +838,11 @@ def main() -> None:
                         "twice the memory)")
     p.add_argument("--save", metavar="MODEL.npz", help="write the model to this file")
     p.add_argument("--cv", type=int, default=0, metavar="N",
-                   help="report N-fold cross-validated R2/Spearman/MAE (default: off)")
+                   help="report N-fold cross-validated R2/Spearman/MAE, or for "
+                        "classification accuracy/ROC AUC/log loss (default: off)")
     p.add_argument("--seed", type=int, default=42, help="TabICL's random seed (default: 42)")
-    p.add_argument("--output-type", default="mean", choices=["mean", "median"],
-                   help="TabICL's point estimate (default: mean)")
+    p.add_argument("--output-type", default=None, choices=["mean", "median"],
+                   help="TabICL's point estimate, for regression (default: mean)")
     p.set_defaults(func=train)
 
     p = sub.add_parser("predict", parents=[common], help="predict new SMILES with a saved model")
