@@ -124,7 +124,7 @@ which takes about the same time (the TabICL classifier checkpoint, 0.1 GB, is
 downloaded the first time) and ends with
 
 ```
-5-fold CV: accuracy 0.900  balanced accuracy 0.653  ROC AUC 0.875  log loss 0.256
+5-fold CV: accuracy 0.900  balanced accuracy 0.653  MCC 0.426  ROC AUC 0.875  log loss 0.256
   class       n  recall  precision
   <100       58   0.328      0.679
   >=100     423   0.979      0.914
@@ -190,12 +190,14 @@ How the target column becomes classes:
 
 With `--cv`, folds keep repeated SMILES together as in regression, and are also
 stratified by class, so a rare class is spread across them. The report gives
-accuracy, balanced accuracy (the mean of the per-class recalls), ROC AUC
-(one-vs-rest, macro-averaged, for more than two classes) and log loss, then each
-class's count, recall and precision. With imbalanced classes, read balanced
-accuracy and the per-class recall rather than accuracy. In the smoke test above,
-88% of molecules are in one class: accuracy is 0.90, but only a third of the
-minority class is found.
+accuracy, balanced accuracy (the mean of the per-class recalls), the Matthews
+correlation coefficient (MCC: from -1 to 1, with 0 no better than chance, using
+every cell of the confusion matrix; the multiclass form for more than two
+classes), ROC AUC (one-vs-rest, macro-averaged, for more than two classes) and
+log loss, then each class's count, recall and precision. With imbalanced classes,
+read balanced accuracy, MCC and the per-class recall rather than accuracy. In the
+smoke test above, 88% of molecules are in one class: accuracy is 0.90, but MCC is
+0.43 and only a third of the minority class is found.
 
 `predict` writes the most probable class and a probability for every class. For
 a decision threshold other than 0.5, or to rank molecules, use the probability
@@ -217,7 +219,7 @@ and a 300-molecule sample of LogD split at 2 (3-fold CV accuracy 0.81, ROC AUC
 | `--zeros {drop,floor,offset,error}` | with `--log`, how to treat zero values (default `drop`) |
 | `--floor VALUE` | with `--zeros floor`, the value zeros become (default: half the smallest positive value) |
 | `--offset VALUE` | with `--zeros offset`, the constant added before the log (default 1) |
-| `--cv N` | report N-fold cross-validated R², Spearman and MAE, on the modelled scale (classification: accuracy, balanced accuracy, ROC AUC, log loss) |
+| `--cv N` | report N-fold cross-validated R², Spearman and MAE, on the modelled scale (classification: accuracy, balanced accuracy, MCC, ROC AUC, log loss) |
 | `--seed` | TabICL's random seed (default 42) |
 | `--output-type {mean,median}` | TabICL's point estimate, for regression (default `mean`) |
 

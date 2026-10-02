@@ -566,7 +566,7 @@ def cross_validate(X, y, groups, n_folds: int, seed: int, task: str, output_type
 
 def report_classification(y, proba, classes: list[str], n_folds: int) -> None:
     from sklearn.metrics import (accuracy_score, balanced_accuracy_score, log_loss,
-                                 roc_auc_score)
+                                 matthews_corrcoef, roc_auc_score)
 
     pred = proba.argmax(axis=1)
     labels = list(range(len(classes)))
@@ -577,6 +577,7 @@ def report_classification(y, proba, classes: list[str], n_folds: int) -> None:
     print(f"{n_folds}-fold CV: "
           f"accuracy {accuracy_score(y, pred):.3f}  "
           f"balanced accuracy {balanced_accuracy_score(y, pred):.3f}  "
+          f"MCC {matthews_corrcoef(y, pred):.3f}  "
           f"ROC AUC {auc:.3f}"
           + ("" if len(classes) == 2 else " (one-vs-rest, macro)")
           + f"  log loss {log_loss(y, proba, labels=labels):.3f}")
@@ -839,7 +840,7 @@ def main() -> None:
     p.add_argument("--save", metavar="MODEL.npz", help="write the model to this file")
     p.add_argument("--cv", type=int, default=0, metavar="N",
                    help="report N-fold cross-validated R2/Spearman/MAE, or for "
-                        "classification accuracy/ROC AUC/log loss (default: off)")
+                        "classification accuracy/MCC/ROC AUC/log loss (default: off)")
     p.add_argument("--seed", type=int, default=42, help="TabICL's random seed (default: 42)")
     p.add_argument("--output-type", default=None, choices=["mean", "median"],
                    help="TabICL's point estimate, for regression (default: mean)")
